@@ -8,8 +8,7 @@ Original file is located at
 """
 
 # 0. Install required libraries
-!pip install feedparser python-dateutil gspread gspread_dataframe transformers torch \
-             beautifulsoup4 readability-lxml trafilatura requests -q
+
 
 # 1. Imports
 import feedparser
@@ -21,21 +20,14 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 from readability import Document
 import trafilatura
+import os
+from google.oauth2.service_account import Credentials
 
-from google.colab import auth
-from google.auth import default
-import gspread
-from gspread_dataframe import set_with_dataframe
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from transformers import pipeline
 
-# 2. Authenticate with Google Sheets
-auth.authenticate_user()
-creds, _ = default()
-gc = gspread.authorize(creds)
-
-# 3. RSS feeds & human-readable names
+# 2. RSS feeds & human-readable names
 feeds = {
     "https://blog.arxiv.org/feed":              "arXiv Blog",
     "https://ai.meta.com/blog/rss/":            "Meta AI Blog",
