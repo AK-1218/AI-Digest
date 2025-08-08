@@ -11,6 +11,7 @@ Original file is located at
 
 
 # 1. Imports
+import os
 import feedparser
 import difflib
 import requests
@@ -20,14 +21,21 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 from readability import Document
 import trafilatura
-import os
-from google.oauth2.service_account import Credentials
 
+import gspread
+from google.oauth2.service_account import Credentials
+from gspread_dataframe import set_with_dataframe
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from transformers import pipeline
 
-# 2. RSS feeds & human-readable names
+# 2. Authenticate with Google Sheets (service account; set by GitHub Actions)
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "service_account.json")
+creds = Credentials.from_service_account_file(cred_path, scopes=SCOPES)
+gc = gspread.authorize(creds)
+
+# 3. RSS feeds & human-readable names
 feeds = {
     "https://blog.arxiv.org/feed":              "arXiv Blog",
     "https://ai.meta.com/blog/rss/":            "Meta AI Blog",
