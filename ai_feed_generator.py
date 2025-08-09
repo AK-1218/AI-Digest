@@ -21,13 +21,12 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 from readability import Document
 import trafilatura
-
+import google.generativeai as genai
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread_dataframe import set_with_dataframe
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from transformers import pipeline
 
 # 2. Authenticate with Google Sheets (service account; set by GitHub Actions)
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -122,42 +121,34 @@ for url, src in feeds.items():
 # 5. Keep the 5 newest articles
 all_articles = sorted(all_articles, key=lambda x: x["PubDT"], reverse=True)[:5]
 
-# 6. Initialize abstractive summarizer (Pegasus)
-summarizer = pipeline(
-    "summarization",
-    model="google/pegasus-cnn_dailymail",
-    tokenizer="google/pegasus-cnn_dailymail"
-)
+# 6. Init Gemini (reads your key from the GitHub secret)
+genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
+_gem_model = genai.GenerativeModel("gemini-1.5-pro")
 
-def transformer_summary(text, max_length=120, min_length=30, timeout=60):
-    # Skip abstractive summary for very short content
-    if len(text.split()) < 50:
+def gemini_summary(text, trim=60000):
+    if not text or len(text.split()) < 50:
         return text
-    snippet = text[:1000] + ("…" if len(text) > 1000 else "")
-    print("  → Summarizing…", end="", flush=True)
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(lambda: summarizer(
-            snippet,
-            max_length=max_length,
-            min_length=min_length,
-            do_sample=False
-        ))
-        try:
-            out = fut.result(timeout=timeout)
-            print(" done.")
-            return out[0]["summary_text"].strip()
-        except TimeoutError:
-            print(" TIMEOUT")
-            return snippet
-        except Exception as e:
-            print(f" ERROR: {e}")
-            return snippet
+    snippet = text[:trim]
+    prompt = (
+        "Summarize the following article in EXACTLY 3 sentences.\n"
+        "- No fluff or hype; keep it factual and clear.\n"
+        "- Include key numbers if present.\n"
+        "- No opinions or predictions.\n\n"
+        f"{snippet}\n\n"
+        "Now write the 3-sentence summary:"
+    )
+    resp = _gem_model.generate_content(prompt)
+    out = (resp.text or "").strip()
+    # keep exactly 3 sentences
+    import re
+    sents = [s.strip() for s in re.split(r'(?<=[.!?])\s+', out) if s.strip()]
+    return " ".join(sents[:3]) if sents else out
 
 # 7. Generate the final “Summary” field
 for i, art in enumerate(all_articles, start=1):
     print(f"[{i}/{len(all_articles)}] Summarizing: {art['Title'][:60]}…")
-    art["Summary"] = transformer_summary(art["Content"])
-    time.sleep(1)  # rate limit
+    art["Summary"] = gemini_summary(art["Content"])
+    time.sleep(1)
 
 # 8. Build DataFrame
 df = pd.DataFrame(all_articles)[["Source", "Date", "Title", "Link", "Summary"]]
