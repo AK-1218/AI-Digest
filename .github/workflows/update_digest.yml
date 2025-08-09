@@ -31,5 +31,6 @@ jobs:
     - name: Run AI Digest
       env:
         GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/service_account.json
+        GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}   # <-- added here
       run: |
         python ai_feed_generator.py
