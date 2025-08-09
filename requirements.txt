@@ -10,5 +10,4 @@ readability-lxml
 trafilatura
 requests
 pandas
-transformers
-torch
+google-generativeai
