@@ -114,6 +114,103 @@ def gemini_summary(text, trim=4500):
 
 # --- your fetch/clean loop stays the same up to building all_articles ---
 
+# 3. RSS feeds & human-readable names (re-add this)
+feeds = {
+    "https://blog.arxiv.org/feed":               "arXiv Blog",
+    "https://ai.meta.com/blog/rss/":             "Meta AI Blog",
+    "https://huggingface.co/blog/feed.xml":      "Hugging Face Blog",
+    "https://openai.com/blog/rss.xml":           "OpenAI Blog",
+    "https://deepmind.google/discover/blog/rss": "DeepMind Blog",
+}
+
+# 4. Fetch, dedupe, extract & clean content (re-add this)
+all_articles = []
+seen_urls = set()
+seen_titles = []
+
+UA = {"User-Agent": "Mozilla/5.0"}
+
+for url, src in feeds.items():
+    try:
+        feed = feedparser.parse(url)
+    except Exception:
+        continue
+
+    # cap per-feed to be gentle on quotas
+    for entry in feed.entries[:10]:
+        # 4a) robust link extraction
+        link = (entry.get("link") or entry.get("id") or entry.get("guid", "")).strip()
+        if not link or link in seen_urls:
+            continue
+
+        # 4b) title & near-duplicate title filter
+        title = (entry.get("title") or "").strip()
+        tl = title.lower()
+        if any(difflib.SequenceMatcher(None, tl, other).ratio() > 0.6 for other in seen_titles):
+            continue
+
+        seen_urls.add(link)
+        seen_titles.append(tl)
+
+        # 4c) publication date
+        raw_dt = entry.get("published", entry.get("updated", "")) or ""
+        try:
+            pub_dt = dateparser.parse(raw_dt)
+        except Exception:
+            pub_dt = datetime(2000, 1, 1)
+
+        # 4d) choose richest HTML field available
+        raw_html = ""
+        try:
+            if entry.get("content"):
+                raw_html = entry.content[0].value
+            elif entry.get("summary"):
+                raw_html = entry.summary
+            elif entry.get("media_content"):
+                maybe_url = entry.media_content[0].get("url", "")
+                if maybe_url.startswith("http"):
+                    raw_html = requests.get(maybe_url, timeout=10, headers=UA).text
+        except Exception:
+            raw_html = ""
+
+        # 4e) readability to strip boilerplate
+        content = ""
+        if raw_html.strip():
+            try:
+                clean_html = Document(raw_html).summary()
+                content = BeautifulSoup(clean_html, "html.parser").get_text(" ", strip=True)
+            except Exception:
+                content = ""
+
+        # 4f) fallback: fetch full page & re-extract if still tiny
+        if len(content.split()) < 50:
+            try:
+                page_html = requests.get(link, timeout=10, headers=UA).text
+                clean_page = Document(page_html).summary()
+                candidate = BeautifulSoup(clean_page, "html.parser").get_text(" ", strip=True)
+                if len(candidate.split()) > len(content.split()):
+                    content = candidate
+            except Exception:
+                pass
+
+        # 4g) append
+        all_articles.append({
+            "Source":  src,
+            "Date":    pub_dt.strftime("%Y-%m-%d"),
+            "Title":   title,
+            "Link":    link,
+            "Content": content,
+            "PubDT":   pub_dt,
+        })
+
+# Safety: handle empty result to avoid crashes
+if not all_articles:
+    print("No articles found; writing empty sheet and exiting.")
+    ws.clear()
+    set_with_dataframe(ws, pd.DataFrame(columns=["Source", "Date", "Title", "Link", "Summary"]))
+    raise SystemExit(0)
+
+
 # 5. Keep the 5 newest articles
 all_articles = sorted(all_articles, key=lambda x: x["PubDT"], reverse=True)[:5]
 
