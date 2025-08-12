@@ -210,22 +210,96 @@ if not all_articles:
     set_with_dataframe(ws, pd.DataFrame(columns=["Source", "Date", "Title", "Link", "Summary"]))
     raise SystemExit(0)
 
+# 5. Select a 5-item batch with ≥3 sources (if possible), newest first
+# ----------------------------
+MAX_UPDATES_PER_RUN = 5
+MIN_DISTINCT_SOURCES = 3
+CANDIDATE_POOL = 60  # look across more items so we can diversify
 
-# 5. Keep the 5 newest articles
-all_articles = sorted(all_articles, key=lambda x: x["PubDT"], reverse=True)[:5]
+# sort everything we scraped by recency (desc)
+all_articles = sorted(all_articles, key=lambda x: x["PubDT"], reverse=True)
 
-# 7. Generate the final “Summary” field (reuse known summaries; otherwise call model)
-for i, art in enumerate(all_articles, start=1):
-    print(f"[{i}/{len(all_articles)}] Summarizing: {art['Title'][:60]}…")
+# candidates we haven't posted before (based on Link)
+unseen = [a for a in all_articles if a["Link"] not in known][:CANDIDATE_POOL]
+
+if not unseen:
+    print("No unseen articles available. Nothing to insert this run.")
+    # nothing new; keep sheet untouched and exit cleanly
+    raise SystemExit(0)
+
+distinct_sources_available = len({a["Source"] for a in unseen})
+need_distinct = min(MIN_DISTINCT_SOURCES, MAX_UPDATES_PER_RUN, distinct_sources_available)
+
+selected = []
+used_links = set()
+used_sources = set()
+
+# Phase 1: ensure diversity—pick the newest items that add *new* sources
+for art in unseen:
+    if len(selected) >= MAX_UPDATES_PER_RUN:
+        break
+    if art["Link"] in used_links:
+        continue
+    if len(used_sources) < need_distinct:
+        if art["Source"] in used_sources:
+            continue  # skip for now to increase diversity
+        selected.append(art)
+        used_links.add(art["Link"])
+        used_sources.add(art["Source"])
+
+# Phase 2: fill the remaining slots by pure recency (any source)
+if len(selected) < MAX_UPDATES_PER_RUN:
+    for art in unseen:
+        if len(selected) >= MAX_UPDATES_PER_RUN:
+            break
+        if art["Link"] in used_links:
+            continue
+        selected.append(art)
+        used_links.add(art["Link"])
+        used_sources.add(art["Source"])
+
+print(f"Picked {len(selected)} updates; sources in batch: {sorted(used_sources)}")
+
+# ----------------------------
+# 6. Summarize only the selected items (reuse when possible)
+# ----------------------------
+for i, art in enumerate(selected, start=1):
+    print(f"[{i}/{len(selected)}] Summarizing: {art['Title'][:80]}…")
     if art["Link"] in known and known[art["Link"]]:
         art["Summary"] = known[art["Link"]]
         continue
     art["Summary"] = gemini_summary(art["Content"])
-    time.sleep(3)  # gentle pacing for free-tier/minute quotas
+    time.sleep(3)  # gentle pacing for free-tier
 
-# 8–9. Build DF and write to Google Sheet (always execute, even if some summaries failed)
-df = pd.DataFrame(all_articles)[["Source", "Date", "Title", "Link", "Summary"]]
-ws.clear()
-set_with_dataframe(ws, df)
-print("✅ AI Digest Sheet updated (with backoff + fallback).")
+# ----------------------------
+# 7. Prepend new rows to the sheet (don’t clear existing)
+# ----------------------------
+expected_header = ["Source", "Date", "Title", "Link", "Summary"]
+try:
+    current_header = [c.strip() for c in ws.row_values(1)[:5]]
+except Exception:
+    current_header = []
+
+# If header missing/mismatched, set it once
+if current_header != expected_header:
+    ws.insert_row(expected_header, 1)
+
+# Build rows (keep newest first so row 2 is the most recent)
+rows_to_insert = [
+    [art["Source"], art["Date"], art["Title"], art["Link"], art["Summary"]]
+    for art in selected
+]
+
+# Insert all at once at row 2 (directly under header)
+# If your gspread version doesn't support insert_rows(list_of_rows),
+# you can loop and ws.insert_row(row, 2) in reverse order.
+try:
+    ws.insert_rows(rows_to_insert, row=2, value_input_option='RAW')
+except TypeError:
+    # Fallback for older gspread: insert one-by-one in reverse
+    for row in reversed(rows_to_insert):
+        ws.insert_row(row, 2, value_input_option='RAW')
+
+print("✅ Prepended updates to Google Sheet without replacing older rows.")
+
 
