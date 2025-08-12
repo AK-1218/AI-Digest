@@ -28,139 +28,104 @@ from gspread_dataframe import set_with_dataframe
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
+# --- after your imports ---
+import re, random
+from google.api_core.exceptions import ResourceExhausted, DeadlineExceeded, InternalServerError
+
 # 2. Authenticate with Google Sheets (service account; set by GitHub Actions)
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "service_account.json")
 creds = Credentials.from_service_account_file(cred_path, scopes=SCOPES)
 gc = gspread.authorize(creds)
 
-# 3. RSS feeds & human-readable names
-feeds = {
-    "https://blog.arxiv.org/feed":              "arXiv Blog",
-    "https://ai.meta.com/blog/rss/":            "Meta AI Blog",
-    "https://huggingface.co/blog/feed.xml":     "Hugging Face Blog",
-    "https://openai.com/blog/rss.xml":          "OpenAI Blog",
-    "https://deepmind.google/discover/blog/rss": "DeepMind Blog"
-}
+# Helper: open/create sheet early so we can also read old rows (to reuse summaries)
+SHEET_NAME = "AI Digest Sheet"
+try:
+    sh = gc.open(SHEET_NAME)
+except gspread.SpreadsheetNotFound:
+    sh = gc.create(SHEET_NAME)
+ws = sh.get_worksheet(0) or sh.sheet1
 
-# 4. Fetch, dedupe, extract & clean content
-all_articles = []
-seen_urls = set()
-seen_titles = []
+# Reuse summaries we already wrote on previous runs (optional but reduces LLM calls)
+try:
+    existing = pd.DataFrame(ws.get_all_records()) if ws.acell('A1').value else pd.DataFrame()
+    known = {row["Link"]: row.get("Summary", "") for _, row in existing.iterrows()} if not existing.empty else {}
+except Exception:
+    known = {}
 
-for url, src in feeds.items():
-    feed = feedparser.parse(url)
-    for entry in feed.entries:
-        # 4a) robust link extraction
-        link = (entry.get("link") or entry.get("id") or entry.get("guid", "")).strip()
-        if not link or link in seen_urls:
-            continue
+# --- feeds dict stays the same ---
 
-        title = entry.get("title", "").strip()
-        tl = title.lower()
-        if any(difflib.SequenceMatcher(None, tl, other).ratio() > 0.6 for other in seen_titles):
-            continue
+# 6. Init Gemini (use lighter model by default)
+genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
+MODEL_ID = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")  # lighter & cheaper than pro
+_gem_model = genai.GenerativeModel(MODEL_ID)
 
-        seen_urls.add(link)
-        seen_titles.append(tl)
-
-        # 4b) publication date
-        raw_dt = entry.get("published", entry.get("updated", ""))
+def _call_gemini(prompt, max_retries=5, base_delay=25):
+    """Robust call with exponential backoff on 429s and transient errors."""
+    for attempt in range(max_retries):
         try:
-            pub_dt = dateparser.parse(raw_dt)
-        except:
-            pub_dt = datetime(2000, 1, 1)
+            return _gem_model.generate_content(
+                prompt,
+                generation_config={"max_output_tokens": 256}
+            )
+        except (ResourceExhausted, DeadlineExceeded, InternalServerError) as e:
+            # backoff with jitter
+            delay = base_delay * (2 ** attempt)
+            time.sleep(delay + random.uniform(0, 5))
+        except Exception as e:
+            # non-retryable or unknown; bubble up on last attempt
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(8 + 4 * attempt)
 
-        # 4c) pull the richest HTML field available
-        raw_html = ""
-        if entry.get("content"):
-            raw_html = entry.content[0].value
-        elif entry.get("summary"):
-            raw_html = entry.summary
-        elif entry.get("media_content"):
-            maybe_url = entry.media_content[0].get("url", "")
-            if maybe_url.startswith("http"):
-                try:
-                    raw_html = requests.get(maybe_url, timeout=10).text
-                except requests.exceptions.RequestException:
-                    raw_html = ""
-        raw_html = raw_html or ""
+def _naive_fallback(text, n_sentences=3):
+    """Free, offline fallback: first N sentences of cleaned text."""
+    if not text:
+        return ""
+    sents = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+    return " ".join(sents[:n_sentences])[:900]
 
-        # 4d) readability-lxml to strip navigation, ads, boilerplate
-        content = ""
-        if raw_html.strip():
-            try:
-                clean_html = Document(raw_html).summary()
-                content = BeautifulSoup(clean_html, "html.parser") \
-                            .get_text(" ", strip=True)
-            except Exception:
-                content = ""
+def gemini_summary(text, trim=4500):
+    """Summarize with Gemini; keep inputs small; fallback if quota is hit."""
+    if not text:
+        return ""
+    # keep inputs tiny for free-tier quotas
+    snippet = text[:trim]
+    prompt = (
+        "Summarize the following article in EXACTLY 3 sentences.\n"
+        "- Keep it factual and concise. Include key numbers if present.\n"
+        "- No hype or predictions.\n\n"
+        f"{snippet}\n\n"
+        "Now write the 3-sentence summary:"
+    )
+    try:
+        resp = _call_gemini(prompt)
+        out = (resp.text or "").strip()
+        sents = [s.strip() for s in re.split(r'(?<=[.!?])\s+', out) if s.strip()]
+        if not sents:
+            return _naive_fallback(text)
+        return " ".join(sents[:3])
+    except Exception:
+        # If we still fail (e.g., daily quota), fallback so the pipeline continues
+        return _naive_fallback(text)
 
-        # 4e) fallback: fetch full page & re-extract if still tiny (<50 words)
-        if len(content.split()) < 50:
-            try:
-                page_html = requests.get(link, timeout=10).text
-                clean_page = Document(page_html).summary()
-                candidate = BeautifulSoup(clean_page, "html.parser") \
-                              .get_text(" ", strip=True)
-                if len(candidate.split()) > len(content.split()):
-                    content = candidate
-            except Exception:
-                pass  # keep whatever content we have
-
-        # 4f) append to list
-        all_articles.append({
-            "Source":  src,
-            "Date":    pub_dt.strftime("%Y-%m-%d"),
-            "Title":   title,
-            "Link":    link,
-            "Content": content,
-            "PubDT":   pub_dt
-        })
+# --- your fetch/clean loop stays the same up to building all_articles ---
 
 # 5. Keep the 5 newest articles
 all_articles = sorted(all_articles, key=lambda x: x["PubDT"], reverse=True)[:5]
 
-# 6. Init Gemini (reads your key from the GitHub secret)
-genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
-_gem_model = genai.GenerativeModel("gemini-1.5-pro")
-
-def gemini_summary(text, trim=60000):
-    if not text or len(text.split()) < 50:
-        return text
-    snippet = text[:trim]
-    prompt = (
-        "Summarize the following article in EXACTLY 3 sentences.\n"
-        "- No fluff or hype; keep it factual and clear.\n"
-        "- Include key numbers if present.\n"
-        "- No opinions or predictions.\n\n"
-        f"{snippet}\n\n"
-        "Now write the 3-sentence summary:"
-    )
-    resp = _gem_model.generate_content(prompt)
-    out = (resp.text or "").strip()
-    # keep exactly 3 sentences
-    import re
-    sents = [s.strip() for s in re.split(r'(?<=[.!?])\s+', out) if s.strip()]
-    return " ".join(sents[:3]) if sents else out
-
-# 7. Generate the final “Summary” field
+# 7. Generate the final “Summary” field (reuse known summaries; otherwise call model)
 for i, art in enumerate(all_articles, start=1):
     print(f"[{i}/{len(all_articles)}] Summarizing: {art['Title'][:60]}…")
+    if art["Link"] in known and known[art["Link"]]:
+        art["Summary"] = known[art["Link"]]
+        continue
     art["Summary"] = gemini_summary(art["Content"])
-    time.sleep(1)
+    time.sleep(3)  # gentle pacing for free-tier/minute quotas
 
-# 8. Build DataFrame
+# 8–9. Build DF and write to Google Sheet (always execute, even if some summaries failed)
 df = pd.DataFrame(all_articles)[["Source", "Date", "Title", "Link", "Summary"]]
-
-# 9. Write to Google Sheet
-sheet_name = "AI Digest Sheet"
-try:
-    sh = gc.open(sheet_name)
-except gspread.SpreadsheetNotFound:
-    sh = gc.create(sheet_name)
-ws = sh.get_worksheet(0)
 ws.clear()
 set_with_dataframe(ws, df)
+print("✅ AI Digest Sheet updated (with backoff + fallback).")
 
-print("✅ AI Digest Sheet updated with cleaner, full-text summaries!")
