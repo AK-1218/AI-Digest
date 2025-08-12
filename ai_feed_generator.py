@@ -33,7 +33,10 @@ import re, random
 from google.api_core.exceptions import ResourceExhausted, DeadlineExceeded, InternalServerError
 
 # 2. Authenticate with Google Sheets (service account; set by GitHub Actions)
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",  # needed for open(by title)/create/share
+]
 cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "service_account.json")
 creds = Credentials.from_service_account_file(cred_path, scopes=SCOPES)
 gc = gspread.authorize(creds)
